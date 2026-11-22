@@ -6,3 +6,4 @@ google-genai
 pydantic
 turso-serverless
 requests
+google-auth

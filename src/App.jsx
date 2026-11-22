@@ -1,5 +1,5 @@
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
 
 function authFetch(url, options = {}) {
@@ -784,6 +784,83 @@ function LoginPage({ onAuthenticated }) {
   const [rememberMe, setRememberMe] = useState(true)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [googleLoading, setGoogleLoading] = useState(false)
+  const [googleReady, setGoogleReady] = useState(false)
+  const googleButtonRef = useRef(null)
+
+  const googleClientId = (import.meta.env.VITE_GOOGLE_CLIENT_ID || '').trim()
+
+  const handleGoogleCredential = useCallback(async (response) => {
+    setError('')
+    setGoogleLoading(true)
+    try {
+      const backendUrl = getApiUrl()
+      if (!backendUrl) {
+        throw new Error(API_NOT_CONFIGURED)
+      }
+      if (!response?.credential) {
+        throw new Error('Google sign-in was cancelled or failed.')
+      }
+      const result = await authFetch(`${backendUrl}/auth/google`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential: response.credential }),
+      }).then(async (fetchResponse) => {
+        const data = await fetchResponse.json().catch(() => ({}))
+        if (!fetchResponse.ok) {
+          throw new Error(data.detail || 'Google sign-in failed.')
+        }
+        return data
+      })
+      onAuthenticated(result.user)
+    } catch (googleError) {
+      setError(googleError.message || 'Google sign-in failed.')
+    } finally {
+      setGoogleLoading(false)
+    }
+  }, [onAuthenticated])
+
+  useEffect(() => {
+    if (!googleClientId) return
+    let cancelled = false
+    const setup = () => {
+      if (cancelled || !window.google?.accounts?.id) return false
+      window.google.accounts.id.initialize({
+        client_id: googleClientId,
+        callback: handleGoogleCredential,
+        auto_select: false,
+        cancel_on_tap_outside: true,
+      })
+      setGoogleReady(true)
+      return true
+    }
+    if (setup()) {
+      return () => {
+        cancelled = true
+      }
+    }
+    const timer = window.setInterval(() => {
+      if (setup()) window.clearInterval(timer)
+    }, 100)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [googleClientId, handleGoogleCredential])
+
+  useEffect(() => {
+    if (!googleReady || !googleButtonRef.current || !window.google?.accounts?.id) return
+    googleButtonRef.current.innerHTML = ''
+    window.google.accounts.id.renderButton(googleButtonRef.current, {
+      type: 'standard',
+      theme: 'outline',
+      size: 'large',
+      text: mode === 'register' ? 'signup_with' : 'signin_with',
+      shape: 'rectangular',
+      logo_alignment: 'left',
+      width: 320,
+    })
+  }, [googleReady, mode])
 
   function switchMode(nextMode) {
     setMode(nextMode)
@@ -920,6 +997,21 @@ function LoginPage({ onAuthenticated }) {
           >
             {mode === 'register' ? 'Already have an account? Sign in' : 'New here? Create an account'}
           </button>
+          {googleClientId && (
+            <div className="google-signin">
+              <div className="auth-divider"><span>or</span></div>
+              {googleReady ? (
+                <div ref={googleButtonRef} className="google-button-container" />
+              ) : (
+                <button type="button" className="google-fallback-button" disabled>
+                  Continue with Google
+                </button>
+              )}
+              {googleLoading && (
+                <div className="form-message" role="status">Signing in with Google…</div>
+              )}
+            </div>
+          )}
         </form>
       </section>
       <aside className="login-aside">

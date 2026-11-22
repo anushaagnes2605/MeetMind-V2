@@ -36,6 +36,8 @@ IS_PRODUCTION = MEETMIND_ENV == "production"
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
 
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+
 _configured_database_path = os.getenv("DATABASE_PATH", "").strip()
 if _configured_database_path:
     _database_path = Path(_configured_database_path)
@@ -294,6 +296,98 @@ def current_user(user: dict = Depends(require_user)):
             "role": user["role"],
         },
     }
+
+
+class GoogleLoginRequest(BaseModel):
+    credential: str = Field(min_length=10, max_length=16384)
+
+
+@app.post("/auth/google")
+def google_login(payload: GoogleLoginRequest, response: Response):
+    """Sign in or register using a Google ID token (verified server-side)."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google Sign-In is not configured")
+
+    try:
+        from google.oauth2 import id_token
+        from google.auth.transport import requests as google_requests
+
+        info = id_token.verify_oauth2_token(
+            payload.credential, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid Google credential")
+
+    issuer = str(info.get("iss", ""))
+    if issuer not in {"accounts.google.com", "https://accounts.google.com"}:
+        raise HTTPException(status_code=401, detail="Invalid Google credential")
+    if not info.get("email_verified"):
+        raise HTTPException(status_code=401, detail="Google email is not verified")
+
+    email = str(info.get("email", "")).strip().lower()
+    if not EMAIL_PATTERN.match(email):
+        raise HTTPException(status_code=401, detail="Google account has no valid email")
+
+    google_sub = str(info.get("sub", "")).strip()
+    display_name = (str(info.get("name") or "").strip() or email.split("@", 1)[0])[:100]
+    avatar_url = info.get("picture")
+
+    user_id: int | None = None
+    with get_db() as db:
+        existing = db.execute(
+            """
+            SELECT id, is_active, google_sub
+            FROM users
+            WHERE email = ?
+            """,
+            (email,),
+        ).fetchone()
+        if existing is not None:
+            if not existing["is_active"]:
+                raise HTTPException(status_code=401, detail="Account is deactivated")
+            existing_sub = existing["google_sub"]
+            if existing_sub and google_sub and existing_sub != google_sub:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This email is already linked to a different Google account",
+                )
+            db.execute(
+                """
+                UPDATE users
+                SET google_sub = COALESCE(google_sub, ?),
+                    avatar_url = COALESCE(avatar_url, ?),
+                    updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (google_sub or None, avatar_url, existing["id"]),
+            )
+            user_id = existing["id"]
+        else:
+            random_password = secrets.token_urlsafe(32)
+            cursor = db.execute(
+                """
+                INSERT INTO users (email, password_hash, display_name, role, google_sub, avatar_url, auth_provider)
+                VALUES (?, ?, ?, 'member', ?, ?, 'google')
+                """,
+                (email, hash_password(random_password), display_name, google_sub or None, avatar_url),
+            )
+            user_id = cursor.lastrowid
+
+    if user_id is None:
+        raise HTTPException(status_code=500, detail="Account could not be created")
+
+    with get_db() as db:
+        user = db.execute(
+            """
+            SELECT id, email, display_name, role
+            FROM users
+            WHERE id = ? AND is_active = 1
+            """,
+            (user_id,),
+        ).fetchone()
+    if user is None:
+        raise HTTPException(status_code=500, detail="Account could not be created")
+    return issue_session(user, response)
 
 
 class TranscriptSubmission(BaseModel):
@@ -1438,6 +1532,18 @@ def init_db():
             );
             """
         )
+
+        # Backwards-compatible migrations for Google Sign-In. SQLite and Turso
+        # do not support `ADD COLUMN IF NOT EXISTS`, so inspect the table first.
+        columns = {row[1] for row in db.execute("PRAGMA table_info(users)").fetchall()}
+        if "google_sub" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
+        if "avatar_url" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT")
+        if "auth_provider" not in columns:
+            db.execute(
+                "ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'password'"
+            )
 
 
 init_db()
