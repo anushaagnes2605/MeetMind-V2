@@ -1811,7 +1811,7 @@ def call_gemini(title: str, transcript: str) -> MeetingAnalysis:
             api_key=api_key,
             http_options=types.HttpOptions(timeout=timeout_ms),
         )
-        model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
         prompt = (
             "Analyze this meeting transcript. Return valid structured JSON only. "
             "Extract summary, speaker statements, decisions with source passages, "
@@ -2077,17 +2077,21 @@ def call_groq(title: str, transcript: str) -> Optional[MeetingAnalysis]:
 
 
 def call_ai_provider(title: str, transcript: str) -> MeetingAnalysis:
-    groq_result = call_groq(title, transcript)
-    if groq_result is not None:
-        return groq_result
-
+    # Gemini is the primary provider. Groq remains a fallback for compatibility
+    # with existing deployments and transient Gemini failures.
     gemini_result = call_gemini(title, transcript)
     if gemini_result.analysis_mode == "gemini":
         return gemini_result
 
-    fallback_reason = "Groq and Gemini were unavailable; rule-based fallback was used."
-    if not os.getenv("GROQ_API_KEY"):
-        fallback_reason = "Groq API key is not configured; Gemini was unavailable or failed; rule-based fallback was used."
+    groq_result = call_groq(title, transcript)
+    if groq_result is not None:
+        return groq_result
+
+    fallback_reason = "Gemini and Groq were unavailable; rule-based fallback was used."
+    if not os.getenv("GEMINI_API_KEY"):
+        fallback_reason = "Gemini API key is not configured; Groq was unavailable or failed; rule-based fallback was used."
+    elif not os.getenv("GROQ_API_KEY"):
+        fallback_reason = "Gemini failed; Groq API key is not configured; rule-based fallback was used."
     return heuristic_analysis(title, transcript, fallback_reason)
 
 

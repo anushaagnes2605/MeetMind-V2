@@ -19,7 +19,7 @@ npm install
 npm run dev
 ```
 
-Copy `backend/.env.example` to `backend/.env` and configure provider credentials. `GROQ_API_KEY` enables Groq as the primary provider; `GROQ_MODEL` defaults to `openai/gpt-oss-120b` and `GROQ_TIMEOUT_MS` defaults to `30000`. Gemini remains the secondary provider through `GEMINI_API_KEY`, `GEMINI_MODEL`, and `GEMINI_TIMEOUT_MS`. Keep provider keys in the backend environment file only. Meeting results are labeled `groq`, `gemini`, or `deterministic_rules` and fall back safely when providers fail.
+Copy `backend/.env.example` to `backend/.env` and configure provider credentials. `GEMINI_API_KEY` enables Gemini as the primary provider; `GEMINI_MODEL` defaults to `gemini-2.5-flash-lite` and `GEMINI_TIMEOUT_MS` defaults to `30000`. Groq remains available as a fallback through `GROQ_API_KEY`, `GROQ_MODEL`, and `GROQ_TIMEOUT_MS`. Keep provider keys in the backend environment file only. Meeting results are labeled `groq`, `gemini`, or `deterministic_rules` and fall back safely when providers fail.
 
 Copy `.env.example` to `.env` if you need to override `VITE_API_URL`.
 
