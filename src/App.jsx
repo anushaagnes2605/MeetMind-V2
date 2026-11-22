@@ -15,13 +15,16 @@ function authFetch(url, options = {}) {
 }
 
 function getApiUrl() {
-  const configured = import.meta.env.VITE_API_URL
+  const configured = (import.meta.env.VITE_API_URL || '').trim()
   if (configured) return configured.replace(/\/$/, '')
   if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
     return 'http://localhost:8001'
   }
   return ''
 }
+
+const API_NOT_CONFIGURED =
+  'This deployment cannot reach the MeetMind API. Set VITE_API_URL to the deployed backend URL and redeploy the frontend.'
 
 const navigation = [
   {
@@ -773,14 +776,23 @@ function MeetingInput() {
 }
 
 function LoginPage({ onAuthenticated }) {
+  const [mode, setMode] = useState('login')
   const [email, setEmail] = useState(() => localStorage.getItem('meetmind_remembered_email') || '')
   const [password, setPassword] = useState('')
+  const [displayName, setDisplayName] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [rememberMe, setRememberMe] = useState(true)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
-  async function handleLogin(event) {
+  function switchMode(nextMode) {
+    setMode(nextMode)
+    setError('')
+    setPassword('')
+    setDisplayName('')
+  }
+
+  async function handleSubmit(event) {
     event.preventDefault()
     setError('')
     if (!email.trim()) {
@@ -791,17 +803,28 @@ function LoginPage({ onAuthenticated }) {
       setError('Enter your password.')
       return
     }
+    if (mode === 'register' && password.length < 8) {
+      setError('Use at least 8 characters for your password.')
+      return
+    }
     setLoading(true)
     try {
       const backendUrl = getApiUrl()
-      const response = await authFetch(`${backendUrl}/auth/login`, {
+      if (!backendUrl) {
+        throw new Error(API_NOT_CONFIGURED)
+      }
+      const endpoint = mode === 'register' ? '/auth/register' : '/auth/login'
+      const body = mode === 'register'
+        ? { email: email.trim(), password, display_name: displayName.trim() }
+        : { email: email.trim(), password }
+      const response = await authFetch(`${backendUrl}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim(), password }),
+        body: JSON.stringify(body),
       })
       const result = await response.json().catch(() => ({}))
       if (!response.ok) {
-        throw new Error(result.detail || 'Unable to sign in.')
+        throw new Error(result.detail || (mode === 'register' ? 'Unable to create account.' : 'Unable to sign in.'))
       }
       if (rememberMe) {
         localStorage.setItem('meetmind_remembered_email', email.trim())
@@ -824,11 +847,26 @@ function LoginPage({ onAuthenticated }) {
           <span>meetmind</span>
         </div>
         <div className="login-heading">
-          <p className="eyebrow">WORKSPACE SIGN IN</p>
-          <h1>Welcome back.</h1>
-          <p>Sign in to turn meetings into decisions and execution.</p>
+          <p className="eyebrow">{mode === 'register' ? 'CREATE WORKSPACE ACCOUNT' : 'WORKSPACE SIGN IN'}</p>
+          <h1>{mode === 'register' ? 'Get started.' : 'Welcome back.'}</h1>
+          <p>{mode === 'register' ? 'Create an account to turn meetings into decisions and execution.' : 'Sign in to turn meetings into decisions and execution.'}</p>
         </div>
-        <form className="login-form" onSubmit={handleLogin}>
+        <form className="login-form" onSubmit={handleSubmit}>
+          {mode === 'register' && (
+            <>
+              <label htmlFor="login-name">Name</label>
+              <input
+                id="login-name"
+                type="text"
+                autoComplete="name"
+                value={displayName}
+                onChange={(event) => setDisplayName(event.target.value)}
+                placeholder="Your name"
+                maxLength={100}
+                disabled={loading}
+              />
+            </>
+          )}
           <label htmlFor="login-email">Email</label>
           <input
             id="login-email"
@@ -870,7 +908,17 @@ function LoginPage({ onAuthenticated }) {
           </label>
           {error && <div className="login-error" role="alert">{error}</div>}
           <button type="submit" className="login-submit" disabled={loading}>
-            {loading ? 'Signing in…' : 'Sign in'}
+            {loading
+              ? (mode === 'register' ? 'Creating account…' : 'Signing in…')
+              : (mode === 'register' ? 'Create account' : 'Sign in')}
+          </button>
+          <button
+            type="button"
+            className="login-switch"
+            onClick={() => switchMode(mode === 'register' ? 'login' : 'register')}
+            disabled={loading}
+          >
+            {mode === 'register' ? 'Already have an account? Sign in' : 'New here? Create an account'}
           </button>
         </form>
       </section>
@@ -891,6 +939,10 @@ function App() {
 
   useEffect(() => {
     const backendUrl = getApiUrl()
+    if (!backendUrl) {
+      setAuthChecking(false)
+      return
+    }
     authFetch(`${backendUrl}/auth/me`)
       .then((response) => {
         if (!response.ok) throw new Error('Unauthorized')

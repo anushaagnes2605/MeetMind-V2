@@ -36,3 +36,7 @@ __pycache__/
 
 # Build files
 backend/venv/
+
+# Local development database (never commit users or password hashes)
+backend/*.db
+*.db-journal

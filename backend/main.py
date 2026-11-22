@@ -6,7 +6,7 @@ import logging
 import json
 import hashlib
 import secrets
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional, Literal
 
 from dotenv import load_dotenv
@@ -18,8 +18,51 @@ from pydantic import ValidationError
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
-DATABASE_PATH = BASE_DIR / "meetmind.db"
 LOGGER = logging.getLogger("meetmind.ai")
+
+# Vercel deployments are production unless MEETMIND_ENV explicitly says
+# otherwise. Relying on MEETMIND_ENV alone meant that forgetting to set it on
+# Vercel silently produced non-production session cookies, so a login from the
+# frontend project was never sent back on the next request.
+IS_VERCEL = bool(os.getenv("VERCEL"))
+MEETMIND_ENV = os.getenv("MEETMIND_ENV", "").strip().lower() or (
+    "production" if IS_VERCEL else "development"
+)
+IS_PRODUCTION = MEETMIND_ENV == "production"
+
+# Vercel functions have a read-only filesystem except for /tmp, and /tmp is
+# ephemeral. A SQLite file therefore cannot store users in production. When a
+# Turso/libSQL database is configured, all queries go there instead.
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+
+_configured_database_path = os.getenv("DATABASE_PATH", "").strip()
+if _configured_database_path:
+    _database_path = Path(_configured_database_path)
+    DATABASE_PATH = _database_path if _database_path.is_absolute() else BASE_DIR / _database_path
+else:
+    DATABASE_PATH = Path("/tmp/meetmind.db") if IS_VERCEL else BASE_DIR / "meetmind.db"
+
+if IS_VERCEL and not TURSO_DATABASE_URL and not _configured_database_path:
+    raise RuntimeError(
+        "Persistent storage is not configured. Vercel's filesystem is read-only "
+        "and ephemeral, so SQLite would lose every user and session. Set "
+        "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in the Vercel project, or set "
+        "DATABASE_PATH to a path on a persistent volume."
+    )
+
+COOKIE_SAMESITE = os.getenv(
+    "COOKIE_SAMESITE", "none" if IS_PRODUCTION else "lax"
+).strip().lower()
+if COOKIE_SAMESITE not in {"lax", "strict", "none"}:
+    raise RuntimeError("COOKIE_SAMESITE must be one of: lax, strict, none")
+
+COOKIE_SECURE = os.getenv(
+    "COOKIE_SECURE", "true" if IS_PRODUCTION else "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+# Browsers reject SameSite=None cookies that are not marked Secure.
+if COOKIE_SAMESITE == "none":
+    COOKIE_SECURE = True
 
 app = FastAPI(
     title="MeetMind API",
@@ -31,9 +74,11 @@ cors_origins = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174",
 ).split(",")
+cors_origin_regex = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in cors_origins if origin.strip()],
+    allow_origins=[origin.strip().rstrip("/") for origin in cors_origins if origin.strip()],
+    allow_origin_regex=cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -45,12 +90,21 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=256)
+    display_name: str = Field(default="", max_length=100)
+
+
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 def require_user(request: Request) -> dict:
-    token = request.cookies.get("meetmind_session")
+    token = request.cookies.get(SESSION_COOKIE_NAME)
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required")
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as db:
         session = db.execute(
             """
@@ -82,24 +136,12 @@ def health():
     return {"status": "healthy"}
 
 
-@app.post("/auth/login")
-def login(payload: LoginRequest, response: Response):
-    email = payload.email.strip().lower()
-    with get_db() as db:
-        user = db.execute(
-            """
-            SELECT id, email, password_hash, display_name, role
-            FROM users
-            WHERE email = ? AND is_active = 1
-            """,
-            (email,),
-        ).fetchone()
-    if user is None or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-
+def issue_session(user: dict, response: Response) -> dict:
     token = secrets.token_urlsafe(32)
-    expires = datetime.now().timestamp() + SESSION_TTL_HOURS * 3600
-    expires_at = datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M:%S")
+    # Store expiry in UTC. Sessions are compared as strings against
+    # datetime('now'), which is UTC, so local server time would skew expiry.
+    expires = datetime.now(timezone.utc).timestamp() + SESSION_TTL_HOURS * 3600
+    expires_at = datetime.fromtimestamp(expires, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as db:
         db.execute(
             """
@@ -113,8 +155,8 @@ def login(payload: LoginRequest, response: Response):
         key=SESSION_COOKIE_NAME,
         value=token,
         httponly=True,
-        secure=os.getenv("MEETMIND_ENV", "development").lower() == "production",
-        samesite="lax",
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
         max_age=SESSION_TTL_HOURS * 3600,
         path="/",
     )
@@ -127,6 +169,89 @@ def login(payload: LoginRequest, response: Response):
             "role": user["role"],
         },
     }
+
+
+def is_integrity_error(exc: Exception) -> bool:
+    return exc.__class__.__name__ == "IntegrityError"
+
+
+def mask_email(email: str) -> str:
+    """Return a log-safe form of an email address."""
+    local, _, domain = email.partition("@")
+    if not domain:
+        return "***"
+    return f"{local[:1]}***@{domain}"
+
+
+@app.post("/auth/login")
+def login(payload: LoginRequest, response: Response):
+    email = payload.email.strip().lower()
+    with get_db() as db:
+        user = db.execute(
+            """
+            SELECT id, email, password_hash, display_name, role, is_active
+            FROM users
+            WHERE email = ?
+            """,
+            (email,),
+        ).fetchone()
+    if user is None:
+        # Never log the password or the raw address. The reason code makes a
+        # production login failure diagnosable from the function logs.
+        LOGGER.warning("Login rejected: no account for %s", mask_email(email))
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not user["is_active"]:
+        LOGGER.warning("Login rejected: account is deactivated for %s", mask_email(email))
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not verify_password(payload.password, user["password_hash"]):
+        LOGGER.warning("Login rejected: password does not match for %s", mask_email(email))
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    return issue_session(user, response)
+
+
+@app.post("/auth/register", status_code=201)
+def register(payload: RegisterRequest, response: Response):
+    email = payload.email.strip().lower()
+    if not EMAIL_PATTERN.match(email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+
+    display_name = payload.display_name.strip() or email.split("@", 1)[0]
+    try:
+        with get_db() as db:
+            existing = db.execute(
+                "SELECT id FROM users WHERE email = ?",
+                (email,),
+            ).fetchone()
+            if existing is not None:
+                raise HTTPException(status_code=409, detail="An account with this email already exists")
+            cursor = db.execute(
+                """
+                INSERT INTO users (email, password_hash, display_name, role)
+                VALUES (?, ?, ?, 'member')
+                """,
+                (email, hash_password(payload.password), display_name),
+            )
+            user_id = cursor.lastrowid
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if is_integrity_error(exc):
+            raise HTTPException(status_code=409, detail="An account with this email already exists") from exc
+        raise
+
+    with get_db() as db:
+        user = db.execute(
+            """
+            SELECT id, email, display_name, role
+            FROM users
+            WHERE id = ? AND is_active = 1
+            """,
+            (user_id,),
+        ).fetchone()
+    if user is None:
+        raise HTTPException(status_code=500, detail="Account could not be created")
+    return issue_session(user, response)
 
 
 @app.post("/auth/logout")
@@ -145,7 +270,8 @@ def logout(request: Request, response: Response):
     response.delete_cookie(
         key=SESSION_COOKIE_NAME,
         httponly=True,
-        samesite="lax",
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
         path="/",
     )
     return {"authenticated": False}
@@ -410,10 +536,49 @@ class CommitmentToolRequest(BaseModel):
     run_id: Optional[int] = None
 
 
+class ManagedConnection:
+    """Context manager that commits/rolls back and always closes the database
+    connection. Both sqlite3 and turso_serverless expose the DB-API surface the
+    rest of this module relies on (execute/fetchone/lastrowid/executescript)."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        return self.connection
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is None:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self.connection.close()
+        return False
+
+
 def get_db():
+    if TURSO_DATABASE_URL:
+        if not TURSO_AUTH_TOKEN:
+            raise RuntimeError("TURSO_AUTH_TOKEN is required when TURSO_DATABASE_URL is set")
+        import turso_serverless
+
+        connection = turso_serverless.connect(
+            TURSO_DATABASE_URL,
+            auth_token=TURSO_AUTH_TOKEN,
+        )
+        # turso_serverless returns plain tuples by default, while this module
+        # reads every column by name (row["password_hash"]). Without a row
+        # factory, login raises "tuple indices must be integers" and every
+        # authenticated endpoint fails. Install the sqlite3.Row-compatible
+        # factory so the Turso and SQLite paths behave identically.
+        connection.row_factory = turso_serverless.Row
+        return ManagedConnection(connection)
+
     connection = sqlite3.connect(DATABASE_PATH)
     connection.row_factory = sqlite3.Row
-    return connection
+    return ManagedConnection(connection)
 
 
 class CreateLocalTaskArgs(BaseModel):
@@ -1313,8 +1478,9 @@ def session_token_hash(token: str) -> str:
 
 
 def seed_demo_user() -> None:
-    environment = os.getenv("MEETMIND_ENV", "development").lower()
-    if environment == "production":
+    # MEETMIND_SKIP_SEED keeps administrative scripts from creating accounts
+    # (including the demo account) in a database they are only inspecting.
+    if IS_PRODUCTION or os.getenv("MEETMIND_SKIP_SEED") == "1":
         return
     email = os.getenv("DEMO_ADMIN_EMAIL", "admin@meetmind.demo").strip().lower()
     password = os.getenv("DEMO_ADMIN_PASSWORD", "MeetMind@123")
@@ -1334,7 +1500,52 @@ def seed_demo_user() -> None:
             )
 
 
+def bootstrap_admin_user() -> None:
+    """Create the first production account from environment variables.
+
+    Production intentionally does not seed the demo account. Set
+    BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD once to recreate an
+    existing account (for example the local demo user) in the hosted database.
+    Existing users are never overwritten.
+    """
+    if os.getenv("MEETMIND_SKIP_SEED") == "1":
+        return
+    email = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
+    password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
+    if not email or not password:
+        return
+    if not EMAIL_PATTERN.match(email):
+        LOGGER.warning("BOOTSTRAP_ADMIN_EMAIL is not a valid email address; skipping bootstrap account")
+        return
+    display_name = os.getenv("BOOTSTRAP_ADMIN_NAME", "MeetMind Admin").strip() or "MeetMind Admin"
+    with get_db() as db:
+        existing = db.execute(
+            "SELECT id, password_hash, is_active FROM users WHERE email = ?",
+            (email,),
+        ).fetchone()
+        if existing is None:
+            try:
+                db.execute(
+                    """
+                    INSERT INTO users (email, password_hash, display_name, role)
+                    VALUES (?, ?, ?, 'admin')
+                    """,
+                    (email, hash_password(password), display_name),
+                )
+                LOGGER.info("Created bootstrap admin account for %s", mask_email(email))
+            except Exception as exc:
+                if not is_integrity_error(exc):
+                    raise
+        elif not verify_password(password, existing["password_hash"]):
+            LOGGER.warning(
+                "Bootstrap account %s already exists with a different password; "
+                "existing accounts are never overwritten.",
+                mask_email(email),
+            )
+
+
 seed_demo_user()
+bootstrap_admin_user()
 
 
 def split_sentences(transcript: str) -> list[str]:
