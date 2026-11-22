@@ -70,11 +70,17 @@ app = FastAPI(
     version="1.0.0",
 )
 
-cors_origins = os.getenv(
-    "CORS_ORIGINS",
-    "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174",
-).split(",")
-cors_origin_regex = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None
+default_cors_origins = (
+    "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174"
+)
+if IS_PRODUCTION:
+    default_cors_origins += ",https://meet-mind-v2.vercel.app"
+
+cors_origins = os.getenv("CORS_ORIGINS", default_cors_origins).split(",")
+cors_origin_regex = os.getenv(
+    "CORS_ORIGIN_REGEX",
+    "https://.*\\.vercel\\.app" if IS_PRODUCTION else "",
+).strip() or None
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip().rstrip("/") for origin in cors_origins if origin.strip()],
